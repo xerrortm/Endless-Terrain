@@ -11,6 +11,4 @@ Check it out on:
 <br>
 https://xerrortm.github.io/Endless-Terrain
 <br><br>
-Or download it here:
-<br>
-https://raw.githubusercontent.com/xerrortm/Endless-Terrain/main/index.html
+Or download the `index.html`
