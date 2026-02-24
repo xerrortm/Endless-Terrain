@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Endless Terrain</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: sans-serif; background-color: #87ceeb; }
+        canvas { display: block; }
+        
+        #ui-overlay {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: white;
+            pointer-events: none;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+            z-index: 10;
+        }
+
+        .controls-hint {
+            background: rgba(0, 0, 0, 0.4);
+            padding: 15px;
+            border-radius: 8px;
+            backdrop-filter: blur(5px);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+
+        #minimap-container {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            width: 180px;
+            height: 180px;
+            border: 3px solid rgba(255,255,255,0.5);
+            border-radius: 10px;
+            overflow: hidden;
+            background: rgba(0,0,0,0.3);
+            z-index: 20;
+        }
+
+        #minimap {
+            width: 100%;
+            height: 100%;
+        }
+
+        #crosshair {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 10px;
+            height: 10px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui-overlay">
+        <div class="controls-hint">
+            <h2 style="margin-top: 0;">Infinite Explorer</h2>
+            <p><strong>WASD</strong>: Move | <strong>ARROWS</strong>: Look</p>
+            <p><strong>SPACE</strong>: Jump | <strong>P</strong>: Pillars | <strong>C</strong>: City</p>
+            <p style="color: #00ffff;">Animals: Cows, Deer, Red/Black Dragons!</p>
+            <p style="color: #ffcc00;">Minimap shows nearby biomes & position.</p>
+        </div>
+    </div>
+
+    <div id="minimap-container">
+        <canvas id="minimap"></canvas>
+    </div>
+
+    <div id="crosshair"></div>
+
+    <script>
+        let scene, camera, renderer, clock, minimapCtx;
+        
+        // Player state
+        let moveForward = false, moveBackward = false, moveLeft = false, moveRight = false;
+        let lookLeft = false, lookRight = false, lookUp = false, lookDown = false;
+        let canJump = false;
+        let velocity = new THREE.Vector3();
+        let direction = new THREE.Vector3();
+        
+        let forcePillarBiomeCoords = null;
+        let forceCityBiomeCoords = null;
+
+        const animals = [];
+        const chunkSize = 120;
+        const chunkSegments = 60; 
+        const viewDistance = 3; 
+        const chunks = new Map(); 
+        const noiseSeed = Math.random() * 5000;
+
+        function getBiomeInfo(cx, cz) {
+            if (forceCityBiomeCoords && Math.abs(cx - forceCityBiomeCoords.cx) < 2 && Math.abs(cz - forceCityBiomeCoords.cz) < 2) {
+                return { isCity: true };
+            }
+            if (forcePillarBiomeCoords && Math.abs(cx - forcePillarBiomeCoords.cx) < 2 && Math.abs(cz - forcePillarBiomeCoords.cz) < 2) {
+                return { isPillars: true, pillarIntensity: 1.0 };
+            }
+
+            const val = Math.sin(cx * 0.15) + Math.cos(cz * 0.15);
+            const rareVal = Math.sin(cx * 0.4 + 50) * Math.cos(cz * 0.4 + 20);
+            const cityVal = Math.sin(cx * 0.9 + 1000) * Math.cos(cz * 0.9 - 2000);
+            const pillarVal = Math.sin(cx * 1.1 + 200) * Math.cos(cz * 1.1 - 400); 
+            const plateauVal = Math.sin(cx * 0.25 + 10) * Math.cos(cz * 0.25 - 50);
+            const villageVal = Math.sin(cx * 0.35 + 500) * Math.cos(cz * 0.35 - 500);
+            
+            return {
+                isIce: val > 1.2 && rareVal < 0.9,
+                isVolcanic: rareVal > 0.94,
+                isCity: cityVal > 0.985, 
+                isPillars: pillarVal > 0.98,
+                pillarIntensity: Math.max(0, (pillarVal - 0.98) / 0.02),
+                isPlateau: plateauVal > 0.92,
+                isVillage: villageVal > 0.85
+            };
+        }
+
+        function getHeight(x, z) {
+            const cx = Math.floor(x / chunkSize);
+            const cz = Math.floor(z / chunkSize);
+            const biome = getBiomeInfo(cx, cz);
+
+            const baseTerrain = (Math.sin(x * 0.01 + noiseSeed) * Math.cos(z * 0.01) * 30) + 
+                                (Math.sin(x * 0.05) * Math.cos(z * 0.05) * 10);
+
+            if (biome.isCity) return baseTerrain * 0.3 + 5;
+            if (biome.isVillage) return baseTerrain * 0.5 + 2;
+
+            if (biome.isPillars) {
+                const centerX = (cx + 0.5) * chunkSize;
+                const centerZ = (cz + 0.5) * chunkSize;
+                const distToCenter = Math.sqrt(Math.pow(x - centerX, 2) + Math.pow(z - centerZ, 2));
+                const smoothBase = Math.max(0, 100 * Math.exp(-(distToCenter * distToCenter) / (2 * Math.pow(50, 2))));
+                let pillarNoise = 0;
+                if (smoothBase > 35) {
+                    const gridX = Math.round(x / 15) * 15;
+                    const gridZ = Math.round(z / 15) * 15;
+                    const d = Math.sqrt(Math.pow(x - gridX, 2) + Math.pow(z - gridZ, 2));
+                    pillarNoise = Math.max(0, 85 - d * 15) * (smoothBase / 80);
+                }
+                return THREE.MathUtils.lerp(baseTerrain, smoothBase + pillarNoise, biome.pillarIntensity);
+            }
+
+            if (biome.isPlateau) return 60 + Math.sin(x * 0.03) * Math.cos(z * 0.03) * 5;
+
+            if (biome.isVolcanic) {
+                // Determine center of volcano in this chunk
+                const centerX = cx * chunkSize + chunkSize / 2;
+                const centerZ = cz * chunkSize + chunkSize / 2;
+                const dx = x - centerX;
+                const dz = z - centerZ;
+                const dist = Math.sqrt(dx * dx + dz * dz);
+                
+                // Cone shape
+                const volcanoHeight = Math.max(0, 80 - dist * 1.8);
+                // Crater
+                const craterDepth = dist < 12 ? (12 - dist) * 2.5 : 0;
+                
+                return baseTerrain + volcanoHeight - craterDepth;
+            }
+
+            let river = Math.abs(Math.sin(x * 0.012 + noiseSeed * 0.3) * Math.cos(z * 0.012));
+            river = Math.pow(river, 5) * -50; 
+            return baseTerrain + river;
+        }
+
+        const geometries = {
+            trunk: new THREE.CylinderGeometry(0.25, 0.4, 2, 8),
+            pineLeaves: new THREE.ConeGeometry(1.5, 4, 8),
+            oakLeaves: new THREE.SphereGeometry(1.5, 8, 8),
+            rock: new THREE.DodecahedronGeometry(1, 0),
+            water: new THREE.PlaneGeometry(chunkSize, chunkSize),
+            skyscraper: new THREE.BoxGeometry(10, 1, 10),
+            glass: new THREE.BoxGeometry(1, 1, 1),
+            houseBody: new THREE.BoxGeometry(4, 4, 4),
+            houseRoof: new THREE.ConeGeometry(3.5, 3, 4),
+            largeBody: new THREE.BoxGeometry(6, 8, 5),
+            largeRoof: new THREE.BoxGeometry(7, 1, 6),
+            towerBody: new THREE.CylinderGeometry(2, 2.2, 10, 8)
+        };
+
+        const materials = {
+            trunk: new THREE.MeshStandardMaterial({ color: 0x4b3621 }),
+            pineLeaves: new THREE.MeshStandardMaterial({ color: 0x1a331a }),
+            oakLeaves: new THREE.MeshStandardMaterial({ color: 0x3a5f0b }),
+            rock: new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.9 }),
+            water: new THREE.MeshStandardMaterial({ color: 0x0077be, transparent: true, opacity: 0.6 }),
+            ice: new THREE.MeshStandardMaterial({ color: 0xddeeff, transparent: true, opacity: 0.9, metalness: 0.5 }),
+            lava: new THREE.MeshStandardMaterial({ color: 0xff4400, emissive: 0xff2200, emissiveIntensity: 2 }),
+            concrete: new THREE.MeshStandardMaterial({ color: 0x555555 }),
+            glass: new THREE.MeshStandardMaterial({ color: 0x88ccff, metalness: 0.9, roughness: 0.1, transparent: true, opacity: 0.7 }),
+            house: new THREE.MeshStandardMaterial({ color: 0x8b5a2b }),
+            mansion: new THREE.MeshStandardMaterial({ color: 0xddccbb }),
+            roof: new THREE.MeshStandardMaterial({ color: 0x442211 }),
+            tower: new THREE.MeshStandardMaterial({ color: 0x666666 }),
+            dragonRed: new THREE.MeshStandardMaterial({ color: 0xcc0000 }),
+            dragonBlack: new THREE.MeshStandardMaterial({ color: 0x111111 }),
+            deerMat: new THREE.MeshStandardMaterial({ color: 0x8b5a2b }),
+            cowMat: new THREE.MeshStandardMaterial({ color: 0xffffff }),
+            birdMat: new THREE.MeshStandardMaterial({ color: 0x222222 })
+        };
+
+        function createAnimal(type, x, z) {
+            const group = new THREE.Group();
+            let moveType = 'walk';
+
+            switch(type) {
+                case 'cow':
+                    const cowBody = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.9, 1.8), materials.cowMat);
+                    cowBody.position.y = 0.9;
+                    const cowHead = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.7, 0.7), materials.cowMat);
+                    cowHead.position.set(0, 1.2, 1.0);
+                    group.add(cowBody, cowHead);
+                    const spot = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.5, 0.1), materials.dragonBlack);
+                    spot.position.set(0.4, 1.2, 0.2);
+                    group.add(spot);
+                    break;
+                case 'bird':
+                    const bBody = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.2, 0.4), materials.birdMat);
+                    const wingL = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.05, 0.3), materials.birdMat);
+                    wingL.position.set(0.4, 0, 0); wingL.name = "wingL";
+                    const wingR = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.05, 0.3), materials.birdMat);
+                    wingR.position.set(-0.4, 0, 0); wingR.name = "wingR";
+                    group.add(bBody, wingL, wingR);
+                    moveType = 'fly';
+                    break;
+                case 'deer':
+                    const dBody = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.8, 1.4), materials.deerMat);
+                    dBody.position.y = 1.3;
+                    const dHead = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.5, 0.4), materials.deerMat);
+                    dHead.position.set(0, 2.0, 0.7);
+                    const antlers = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.1, 0.1), materials.trunk);
+                    antlers.position.set(0, 2.3, 0.7);
+                    group.add(dBody, dHead, antlers);
+                    break;
+                case 'dragon':
+                    const drBody = new THREE.Mesh(new THREE.BoxGeometry(2, 1.2, 4.5), materials.dragonRed);
+                    const drWingL = new THREE.Mesh(new THREE.BoxGeometry(5, 0.1, 2.5), materials.dragonBlack);
+                    drWingL.position.set(3, 0.5, 0); drWingL.name = "wingL";
+                    const drWingR = new THREE.Mesh(new THREE.BoxGeometry(5, 0.1, 2.5), materials.dragonBlack);
+                    drWingR.position.set(-3, 0.5, 0); drWingR.name = "wingR";
+                    const tailGroup = new THREE.Group();
+                    tailGroup.name = "tail";
+                    for(let i=0; i<8; i++) {
+                        const seg = new THREE.Mesh(new THREE.BoxGeometry(0.8 - i*0.08, 0.6 - i*0.05, 1.5), i % 2 === 0 ? materials.dragonRed : materials.dragonBlack);
+                        seg.position.z = -2.2 - (i * 1.3);
+                        seg.name = "seg"+i;
+                        tailGroup.add(seg);
+                    }
+                    group.add(drBody, drWingL, drWingR, tailGroup);
+                    moveType = 'fly';
+                    break;
+            }
+
+            const y = (moveType === 'fly') ? 50 + Math.random() * 40 : getHeight(x, z);
+            group.position.set(x, y, z);
+            scene.add(group);
+            animals.push({ 
+                mesh: group, 
+                type, 
+                moveType, 
+                offset: Math.random() * 100,
+                dir: Math.random() * Math.PI * 2,
+                speed: 0.05 + Math.random() * 0.1
+            });
+            return group;
+        }
+
+        function createObject(type, x, y, z) {
+            const group = new THREE.Group();
+            switch(type) {
+                case 'house':
+                    const body = new THREE.Mesh(geometries.houseBody, materials.house);
+                    body.position.y = 2;
+                    const roof = new THREE.Mesh(geometries.houseRoof, materials.roof);
+                    roof.position.y = 5.5; roof.rotation.y = Math.PI/4;
+                    group.add(body, roof);
+                    break;
+                case 'mansion':
+                    const mb = new THREE.Mesh(geometries.largeBody, materials.mansion);
+                    mb.position.y = 4;
+                    const mr = new THREE.Mesh(geometries.largeRoof, materials.roof);
+                    mr.position.y = 8.5;
+                    group.add(mb, mr);
+                    break;
+                case 'tower':
+                    const tb = new THREE.Mesh(geometries.towerBody, materials.tower);
+                    tb.position.y = 5;
+                    const tr = new THREE.Mesh(geometries.houseRoof, materials.roof);
+                    tr.position.y = 11.5; tr.scale.set(1.5, 1.5, 1.5);
+                    group.add(tb, tr);
+                    break;
+                case 'pine':
+                    group.add(new THREE.Mesh(geometries.trunk, materials.trunk));
+                    const pl = new THREE.Mesh(geometries.pineLeaves, materials.pineLeaves);
+                    pl.position.y = 2.5; group.add(pl);
+                    break;
+                case 'oak':
+                    group.add(new THREE.Mesh(geometries.trunk, materials.trunk));
+                    const ol = new THREE.Mesh(geometries.oakLeaves, materials.oakLeaves);
+                    ol.position.y = 1.5; group.add(ol);
+                    break;
+                case 'rock':
+                    group.add(new THREE.Mesh(geometries.rock, materials.rock));
+                    break;
+            }
+            group.position.set(x, y, z);
+            return group;
+        }
+
+        function createChunk(cx, cz) {
+            const key = `${cx},${cz}`;
+            if (chunks.has(key)) return;
+
+            const biome = getBiomeInfo(cx, cz);
+            const geometry = new THREE.PlaneGeometry(chunkSize, chunkSize, chunkSegments, chunkSegments);
+            geometry.rotateX(-Math.PI / 2);
+
+            const vertices = geometry.attributes.position.array;
+            const colors = [];
+            
+            for (let i = 0; i < vertices.length; i += 3) {
+                const vx = vertices[i] + (cx * chunkSize);
+                const vz = vertices[i + 2] + (cz * chunkSize);
+                const h = getHeight(vx, vz);
+                vertices[i + 1] = h;
+
+                const color = new THREE.Color();
+                if (biome.isCity) {
+                    const gx = Math.abs(vx % 40); const gz = Math.abs(vz % 40);
+                    if (gx < 6 || gz < 6) color.setHex(0x333333); else color.setHex(0x445544);
+                } else if (biome.isPillars) {
+                    const it = biome.pillarIntensity;
+                    if (h > 110 * it) color.setHex(0x2d5a27); else if (h > 40 * it) color.setHex(0x777b7e); else color.setHex(0x3ea33e);
+                } else if (biome.isPlateau) {
+                    if (h > 55) color.setHex(0x55aa55); else color.setHex(0x776655);
+                } else if (biome.isVolcanic) {
+                    if (h < -8) color.setHex(0x110800); 
+                    else if (h > 50) color.setHex(0xff3300); 
+                    else if (h > 20) color.setHex(0x333333);
+                    else color.setHex(0x222222);
+                } else if (biome.isIce) {
+                    if (h < -8) color.setHex(0xb0d0e0); else color.setHex(0xe0f7fa);
+                } else {
+                    if (h < -12) color.setHex(0x1a3a5a); else if (h < -8) color.setHex(0xDEB887); else if (h < 18) color.setHex(0x3ea33e); else color.setHex(0xeeeeee);
+                }
+                colors.push(color.r, color.g, color.b);
+            }
+
+            geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+            geometry.computeVertexNormals();
+
+            const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true }));
+            mesh.position.set(cx * chunkSize, 0, cz * chunkSize);
+            scene.add(mesh);
+
+            const surface = new THREE.Mesh(geometries.water, biome.isVolcanic ? materials.lava : (biome.isIce ? materials.ice : materials.water));
+            surface.rotateX(-Math.PI / 2);
+            surface.position.y = -10;
+            mesh.add(surface);
+
+            const spawnChance = (biome.isCity) ? 0 : 0.85; 
+            if (Math.random() < spawnChance) {
+                const numAnimals = 1 + Math.floor(Math.random() * 30);
+                for(let k=0; k<numAnimals; k++) {
+                    const ax = cx * chunkSize + (Math.random()-0.5)*chunkSize;
+                    const az = cz * chunkSize + (Math.random()-0.5)*chunkSize;
+                    if (biome.isIce || biome.isPlateau) createAnimal('deer', ax, az);
+                    else if (biome.isVolcanic) createAnimal('dragon', ax, az);
+                    else createAnimal(Math.random() > 0.4 ? 'cow' : 'bird', ax, az);
+                }
+            }
+
+            if (biome.isCity) {
+                for (let lx = -chunkSize/2 + 20; lx < chunkSize/2; lx += 40) {
+                    for (let lz = -chunkSize/2 + 20; lz < chunkSize/2; lz += 40) {
+                        const h = getHeight(lx + cx * chunkSize, lz + cz * chunkSize);
+                        const group = new THREE.Group();
+                        const bH = 30 + Math.random() * 60;
+                        const b = new THREE.Mesh(geometries.skyscraper, materials.concrete);
+                        b.scale.y = bH; b.position.y = bH/2; group.add(b);
+                        group.position.set(lx, h, lz); mesh.add(group);
+                    }
+                }
+            } else if (biome.isVillage) {
+                for(let i=0; i<8; i++) {
+                    const rx = (Math.random()-0.5)*chunkSize; const rz = (Math.random()-0.5)*chunkSize;
+                    const h = getHeight(rx + cx * chunkSize, rz + cz * chunkSize);
+                    const type = Math.random() > 0.8 ? 'mansion' : (Math.random() > 0.6 ? 'tower' : 'house');
+                    mesh.add(createObject(type, rx, h, rz));
+                }
+            } else {
+                const pCount = biome.isPillars ? 6 : (biome.isPlateau ? 15 : 30);
+                for(let i=0; i<pCount; i++) {
+                    const rx = (Math.random()-0.5)*chunkSize; const rz = (Math.random()-0.5)*chunkSize;
+                    const h = getHeight(rx + cx * chunkSize, rz + cz * chunkSize);
+                    if (h <= -9) continue;
+                    let type = (h < 10) ? 'oak' : 'pine';
+                    if (Math.random() > 0.9) type = 'rock';
+                    mesh.add(createObject(type, rx, h, rz));
+                }
+            }
+            chunks.set(key, mesh);
+        }
+
+        function updateChunks() {
+            const px = camera.position.x;
+            const pz = camera.position.z;
+            const currentCx = Math.floor(px / chunkSize);
+            const currentCz = Math.floor(pz / chunkSize);
+
+            for (let x = -viewDistance; x <= viewDistance; x++) {
+                for (let z = -viewDistance; z <= viewDistance; z++) {
+                    createChunk(currentCx + x, currentCz + z);
+                }
+            }
+
+            for (const [key, mesh] of chunks.entries()) {
+                const [cx, cz] = key.split(',').map(Number);
+                if (Math.abs(cx - currentCx) > viewDistance + 1 || Math.abs(cz - currentCz) > viewDistance + 1) {
+                    scene.remove(mesh);
+                    mesh.geometry.dispose();
+                    mesh.material.dispose();
+                    chunks.delete(key);
+                }
+            }
+        }
+
+        function updateMinimap() {
+            const canvas = document.getElementById('minimap');
+            const size = canvas.width;
+            const halfSize = size / 2;
+            minimapCtx.clearRect(0, 0, size, size);
+
+            const mapScale = 0.5; // Controls zoom level of map
+            const px = camera.position.x;
+            const pz = camera.position.z;
+
+            // Draw nearby biomes onto map
+            for (let dx = -10; dx <= 10; dx++) {
+                for (let dz = -10; dz <= 10; dz++) {
+                    const worldX = px + dx * 20;
+                    const worldZ = pz + dz * 20;
+                    const cx = Math.floor(worldX / chunkSize);
+                    const cz = Math.floor(worldZ / chunkSize);
+                    const biome = getBiomeInfo(cx, cz);
+                    
+                    let color = '#3ea33e';
+                    if (biome.isCity) color = '#444444';
+                    else if (biome.isVolcanic) color = '#ff4400';
+                    else if (biome.isIce) color = '#ffffff';
+                    else if (biome.isPillars) color = '#2d5a27';
+                    else if (biome.isPlateau) color = '#776655';
+                    else if (biome.isVillage) color = '#8b5a2b';
+
+                    minimapCtx.fillStyle = color;
+                    minimapCtx.fillRect(halfSize + dx * 8, halfSize + dz * 8, 9, 9);
+                }
+            }
+
+            // Draw player
+            minimapCtx.fillStyle = 'yellow';
+            minimapCtx.beginPath();
+            minimapCtx.arc(halfSize, halfSize, 4, 0, Math.PI * 2);
+            minimapCtx.fill();
+            
+            // Draw look direction
+            const lookDir = new THREE.Vector3();
+            camera.getWorldDirection(lookDir);
+            minimapCtx.strokeStyle = 'white';
+            minimapCtx.lineWidth = 2;
+            minimapCtx.beginPath();
+            minimapCtx.moveTo(halfSize, halfSize);
+            minimapCtx.lineTo(halfSize + lookDir.x * 15, halfSize + lookDir.z * 15);
+            minimapCtx.stroke();
+        }
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x87ceeb);
+            scene.fog = new THREE.Fog(0x87ceeb, 20, chunkSize * (viewDistance + 0.5));
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 4000);
+            camera.rotation.order = 'YXZ';
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            document.body.appendChild(renderer.domElement);
+            
+            // Minimap setup
+            const minimapCanvas = document.getElementById('minimap');
+            minimapCanvas.width = 180;
+            minimapCanvas.height = 180;
+            minimapCtx = minimapCanvas.getContext('2d');
+
+            scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+            const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+            sun.position.set(100, 200, 100);
+            scene.add(sun);
+            
+            setupInput();
+            camera.position.set(0, 50, 0);
+            clock = new THREE.Clock();
+            animate();
+        }
+
+        function setupInput() {
+            const handleKey = (code, isDown) => {
+                switch (code) {
+                    case 'KeyW': moveForward = isDown; break;
+                    case 'KeyS': moveBackward = isDown; break;
+                    case 'KeyA': moveLeft = isDown; break;
+                    case 'KeyD': moveRight = isDown; break;
+                    case 'KeyP': if (isDown) { forcePillarBiomeCoords = { cx: Math.floor(camera.position.x / chunkSize), cz: Math.floor(camera.position.z / chunkSize) }; clearChunks(); } break;
+                    case 'KeyC': if (isDown) { forceCityBiomeCoords = { cx: Math.floor(camera.position.x / chunkSize), cz: Math.floor(camera.position.z / chunkSize) }; clearChunks(); } break;
+                    case 'ArrowLeft': lookLeft = isDown; break;
+                    case 'ArrowRight': lookRight = isDown; break;
+                    case 'ArrowUp': lookUp = isDown; break;
+                    case 'ArrowDown': lookDown = isDown; break;
+                    case 'Space': if (isDown && canJump) { velocity.y += 22; canJump = false; } break;
+                }
+            };
+            document.addEventListener('keydown', (e) => handleKey(e.code, true));
+            document.addEventListener('keyup', (e) => handleKey(e.code, false));
+        }
+
+        function clearChunks() {
+            for (const [key, mesh] of chunks.entries()) {
+                scene.remove(mesh);
+                chunks.delete(key);
+            }
+            for (const a of animals) scene.remove(a.mesh);
+            animals.length = 0;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = Math.min(clock.getDelta(), 0.1);
+            const time = clock.elapsedTime;
+
+            const rotationSpeed = 2.2 * delta;
+            if (lookLeft) camera.rotation.y += rotationSpeed;
+            if (lookRight) camera.rotation.y -= rotationSpeed;
+            if (lookUp) camera.rotation.x = Math.min(Math.PI/2.2, camera.rotation.x + rotationSpeed);
+            if (lookDown) camera.rotation.x = Math.max(-Math.PI/2.2, camera.rotation.x - rotationSpeed);
+            
+            velocity.x -= velocity.x * 10.0 * delta;
+            velocity.z -= velocity.z * 10.0 * delta;
+            velocity.y -= 9.8 * 4.0 * delta;
+            
+            direction.z = Number(moveForward) - Number(moveBackward);
+            direction.x = Number(moveRight) - Number(moveLeft);
+            direction.normalize();
+            
+            if (moveForward || moveBackward) velocity.z -= direction.z * 400.0 * delta;
+            if (moveLeft || moveRight) velocity.x -= direction.x * 400.0 * delta;
+            
+            const camDir = new THREE.Vector3();
+            camera.getWorldDirection(camDir);
+            camDir.y = 0; camDir.normalize();
+            const camSide = new THREE.Vector3().crossVectors(camera.up, camDir).normalize();
+            
+            camera.position.addScaledVector(camDir, -velocity.z * delta);
+            camera.position.addScaledVector(camSide, velocity.x * delta);
+            camera.position.y += velocity.y * delta;
+            
+            const gH = getHeight(camera.position.x, camera.position.z) + 2.2;
+            const cH = Math.max(gH, -10 + 1.8);
+            if (camera.position.y < cH) {
+                velocity.y = 0; camera.position.y = cH; canJump = true;
+            }
+
+            for(let i = animals.length - 1; i >= 0; i--) {
+                const a = animals[i];
+                if (camera.position.distanceTo(a.mesh.position) > 500) {
+                    scene.remove(a.mesh);
+                    animals.splice(i, 1);
+                    continue;
+                }
+
+                if (a.moveType === 'fly') {
+                    a.mesh.position.x += Math.sin(time * 0.5 + a.offset) * a.speed * 2;
+                    a.mesh.position.z += Math.cos(time * 0.5 + a.offset) * a.speed * 2;
+                    a.mesh.rotation.y = (time * 0.5 + a.offset);
+                    const wingL = a.mesh.getObjectByName("wingL");
+                    const wingR = a.mesh.getObjectByName("wingR");
+                    if (wingL) wingL.rotation.z = Math.sin(time * 10) * 0.6;
+                    if (wingR) wingR.rotation.z = -Math.sin(time * 10) * 0.6;
+                    if (a.type === 'dragon') {
+                        const tail = a.mesh.getObjectByName("tail");
+                        tail.children.forEach((seg, idx) => {
+                            seg.rotation.y = Math.sin(time * 3 + idx * 0.5) * 0.3;
+                        });
+                    }
+                } else {
+                    a.dir += (Math.random() - 0.5) * 0.1;
+                    a.mesh.position.x += Math.sin(a.dir) * a.speed;
+                    a.mesh.position.z += Math.cos(a.dir) * a.speed;
+                    a.mesh.rotation.y = a.dir + Math.PI;
+                    const currentGround = getHeight(a.mesh.position.x, a.mesh.position.z);
+                    a.mesh.position.y = currentGround + Math.abs(Math.sin(time * 5 + a.offset)) * 0.15;
+                }
+            }
+
+            updateChunks();
+            updateMinimap();
+            renderer.render(scene, camera);
+        }
+        window.onload = init;
+    </script>
+</body>
+</html>
