@@ -11,3 +11,5 @@ Check it out [here](https://xerrortm.github.io/Endless-Terrain):
 
 Or download the `index.html`
 
+![preview1](preview1.jpeg)
+![preview2](preview2.jpeg)
